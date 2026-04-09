@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -87,15 +88,15 @@ func listModules() {
 	banner()
 	fmt.Printf("%s  Available modules:%s\n\n", Bold, Reset)
 	descs := map[string]string{
-		"methods":  "HTTP methods + method override headers (21 requests)",
+		"methods":  "HTTP methods + overrides + Accept/Content-Type (30 requests)",
 		"paths":    "Path manipulation, encoding, case, extensions (47 requests)",
 		"headers":  "IP spoofing headers x10 IPs (220 requests)",
-		"rewrite":  "X-Original-URL, X-Rewrite-URL (5 requests)",
+		"rewrite":  "X-Original-URL, X-Rewrite-URL, X-Forwarded-Prefix (9 requests)",
 		"ua":       "User-Agent spoofing: Googlebot, Bingbot, etc. (9 requests)",
 		"referer":  "Referer header spoofing (6 requests)",
-		"host":     "Host header manipulation (5 requests)",
+		"host":     "Host header manipulation + confusion (8 requests)",
 		"hopbyhop": "Hop-by-hop header abuse to strip security headers (11 requests)",
-		"protocol": "HTTP/1.0, HTTP/1.1, HTTP/2 (3 requests)",
+		"protocol": "HTTP/1.0, HTTP/1.1, HTTP/2 real protocol switch (3 requests)",
 		"port":     "X-Forwarded-Proto, X-Forwarded-Port (6 requests)",
 		"misc":     "Wayback Machine, direct IP, API version fuzzing (varies)",
 	}
@@ -117,6 +118,15 @@ func NewScanner(cfg Config) *Scanner {
 		DisableKeepAlives:   false,
 		Proxy:               http.ProxyFromEnvironment,
 		ForceAttemptHTTP2:   true,
+	}
+
+	if cfg.Proxy != "" {
+		proxyURL, err := url.Parse(cfg.Proxy)
+		if err != nil {
+			fmt.Printf("%sInvalid proxy URL: %v%s\n", Red, err, Reset)
+			os.Exit(1)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 
 	client := &http.Client{
@@ -142,11 +152,15 @@ func NewScanner(cfg Config) *Scanner {
 	}
 }
 
-func (s *Scanner) doRequest(category, technique, method, url string, headers map[string]string) {
+func (s *Scanner) doRequest(category, technique, method, reqURL string, headers map[string]string) {
+	s.doRequestWithClient(s.client, category, technique, method, reqURL, headers)
+}
+
+func (s *Scanner) doRequestWithClient(client *http.Client, category, technique, method, reqURL string, headers map[string]string) {
 	s.sem <- struct{}{}
 	defer func() { <-s.sem }()
 
-	req, err := http.NewRequest(method, url, nil)
+	req, err := http.NewRequest(method, reqURL, nil)
 	if err != nil {
 		if s.cfg.Verbose {
 			fmt.Printf("%s  [ERR] %s: %v%s\n", Gray, technique, err, Reset)
@@ -175,7 +189,7 @@ func (s *Scanner) doRequest(category, technique, method, url string, headers map
 	}
 
 	start := time.Now()
-	resp, err := s.client.Do(req)
+	resp, err := client.Do(req)
 	elapsed := time.Since(start).Seconds()
 
 	if err != nil {
@@ -186,7 +200,13 @@ func (s *Scanner) doRequest(category, technique, method, url string, headers map
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if s.cfg.Verbose {
+			fmt.Printf("%s  [ERR] %s: read body: %v%s\n", Gray, technique, err, Reset)
+		}
+		return
+	}
 	size := int64(len(body))
 
 	result := Result{
@@ -270,6 +290,32 @@ func (s *Scanner) runMethods() {
 		defer wg.Done()
 		s.doRequest("METHOD", "-X POST Content-Length:0", "POST", s.baseURL(), map[string]string{"Content-Length": "0"})
 	}()
+
+	// Accept header variants - backends may route differently based on Accept
+	accepts := []string{
+		"application/json", "application/xml", "text/plain",
+		"text/html", "*/*",
+	}
+	for _, a := range accepts {
+		wg.Add(1)
+		go func(accept string) {
+			defer wg.Done()
+			s.doRequest("ACCEPT", fmt.Sprintf("-H 'Accept: %s'", accept), "GET", s.baseURL(), map[string]string{"Accept": accept})
+		}(a)
+	}
+
+	// Content-Type tricks on POST - frameworks may route based on Content-Type
+	ctypes := []string{
+		"application/json", "application/xml",
+		"application/x-www-form-urlencoded", "text/plain",
+	}
+	for _, ct := range ctypes {
+		wg.Add(1)
+		go func(ctype string) {
+			defer wg.Done()
+			s.doRequest("CONTENT-TYPE", fmt.Sprintf("-X POST -H 'Content-Type: %s'", ctype), "POST", s.baseURL(), map[string]string{"Content-Type": ctype, "Content-Length": "0"})
+		}(ct)
+	}
 
 	wg.Wait()
 }
@@ -377,6 +423,21 @@ func (s *Scanner) runRewrite() {
 		defer wg.Done()
 		s.doRequest("REWRITE", fmt.Sprintf("-H 'Referer: %s'", s.baseURL()), "GET", s.baseURL(), map[string]string{"Referer": s.baseURL()})
 	}()
+
+	// X-Forwarded-Prefix - used by Spring Boot, Traefik, and others to rewrite path prefixes
+	prefixes := []string{"/", "/" + s.cfg.Path, "/api", ""}
+	for _, p := range prefixes {
+		wg.Add(1)
+		go func(prefix string) {
+			defer wg.Done()
+			label := prefix
+			if label == "" {
+				label = "(empty)"
+			}
+			s.doRequest("REWRITE", fmt.Sprintf("-H 'X-Forwarded-Prefix: %s'", label), "GET", s.baseURL(), map[string]string{"X-Forwarded-Prefix": prefix})
+		}(p)
+	}
+
 	wg.Wait()
 }
 
@@ -454,6 +515,27 @@ func (s *Scanner) runHost() {
 			s.doRequest("HOST", fmt.Sprintf("-H '%s: %s'", h, d), "GET", s.baseURL(), map[string]string{h: v})
 		}(t.h, t.v)
 	}
+
+	// Combined Host confusion: spoofed Host + real domain via X-Forwarded-Host
+	// Reverse proxies may use one, backends may use the other
+	domain := strings.TrimPrefix(strings.TrimPrefix(s.cfg.URL, "https://"), "http://")
+	domain = strings.Split(domain, "/")[0]
+	domain = strings.Split(domain, ":")[0]
+
+	combos := []struct{ host, xfh string }{
+		{"localhost", domain},
+		{"127.0.0.1", domain},
+		{domain, "localhost"},
+	}
+	for _, c := range combos {
+		wg.Add(1)
+		go func(host, xfh string) {
+			defer wg.Done()
+			s.doRequest("HOST-CONFUSION", fmt.Sprintf("Host:%s + X-Forwarded-Host:%s", host, xfh), "GET", s.baseURL(),
+				map[string]string{"Host": host, "X-Forwarded-Host": xfh})
+		}(c.host, c.xfh)
+	}
+
 	wg.Wait()
 }
 
@@ -483,9 +565,103 @@ func (s *Scanner) runHopByHop() {
 
 func (s *Scanner) runProtocol() {
 	s.section("Protocol Version")
-	s.doRequest("PROTOCOL", "--http1.0 "+s.baseURL(), "GET", s.baseURL(), nil)
-	s.doRequest("PROTOCOL", "--http1.1 "+s.baseURL(), "GET", s.baseURL(), nil)
-	s.doRequest("PROTOCOL", "--http2 "+s.baseURL(), "GET", s.baseURL(), nil)
+
+	// HTTP/1.1 only: disable HTTP/2 via empty TLSNextProto
+	h11Transport := &http.Transport{
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+		ForceAttemptHTTP2: false,
+		TLSNextProto:     make(map[string]func(string, *tls.Conn) http.RoundTripper),
+	}
+	if s.cfg.Proxy != "" {
+		if proxyURL, err := url.Parse(s.cfg.Proxy); err == nil {
+			h11Transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+	h11Client := &http.Client{
+		Timeout:   time.Duration(s.cfg.Timeout) * time.Second,
+		Transport: h11Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// HTTP/2 forced
+	h2Transport := &http.Transport{
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+		ForceAttemptHTTP2: true,
+	}
+	if s.cfg.Proxy != "" {
+		if proxyURL, err := url.Parse(s.cfg.Proxy); err == nil {
+			h2Transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+	h2Client := &http.Client{
+		Timeout:   time.Duration(s.cfg.Timeout) * time.Second,
+		Transport: h2Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	var wg sync.WaitGroup
+
+	// HTTP/1.0: set Proto fields + Connection: close on HTTP/1.1 transport
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.sem <- struct{}{}
+		defer func() { <-s.sem }()
+
+		req, err := http.NewRequest("GET", s.baseURL(), nil)
+		if err != nil {
+			return
+		}
+		req.Proto = "HTTP/1.0"
+		req.ProtoMajor = 1
+		req.ProtoMinor = 0
+		req.Header.Set("Connection", "close")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		if s.cfg.Cookie != "" {
+			req.Header.Set("Cookie", s.cfg.Cookie)
+		}
+
+		start := time.Now()
+		resp, err := h11Client.Do(req)
+		elapsed := time.Since(start).Seconds()
+		if err != nil {
+			if s.cfg.Verbose {
+				fmt.Printf("%s  [ERR] HTTP/1.0: %v%s\n", Gray, err, Reset)
+			}
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+
+		result := Result{
+			Category: "PROTOCOL", Technique: "HTTP/1.0 " + s.baseURL(),
+			StatusCode: resp.StatusCode, Size: int64(len(body)), Time: elapsed,
+		}
+		s.mu.Lock()
+		s.results = append(s.results, result)
+		s.mu.Unlock()
+		s.printResult(result)
+	}()
+
+	// HTTP/1.1
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.doRequestWithClient(h11Client, "PROTOCOL", "HTTP/1.1 "+s.baseURL(), "GET", s.baseURL(), nil)
+	}()
+
+	// HTTP/2
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.doRequestWithClient(h2Client, "PROTOCOL", "HTTP/2 "+s.baseURL(), "GET", s.baseURL(), nil)
+	}()
+
+	wg.Wait()
 }
 
 // ── MODULE: Port & Proto Headers ─────────────────────────────────────────────
@@ -671,19 +847,28 @@ func (s *Scanner) printSummary(elapsed time.Duration) {
 
 	if s.cfg.Output == "json" {
 		f := fmt.Sprintf("/tmp/fck403_%d.json", time.Now().Unix())
-		data, _ := json.MarshalIndent(s.results, "", "  ")
-		os.WriteFile(f, data, 0644)
-		fmt.Printf("\n  %sJSON: %s%s\n", Cyan, f, Reset)
+		data, err := json.MarshalIndent(s.results, "", "  ")
+		if err != nil {
+			fmt.Printf("\n  %sJSON marshal error: %v%s\n", Red, err, Reset)
+		} else if err := os.WriteFile(f, data, 0644); err != nil {
+			fmt.Printf("\n  %sJSON write error: %v%s\n", Red, err, Reset)
+		} else {
+			fmt.Printf("\n  %sJSON: %s%s\n", Cyan, f, Reset)
+		}
 	}
 	if s.cfg.Output == "csv" {
 		f := fmt.Sprintf("/tmp/fck403_%d.csv", time.Now().Unix())
-		file, _ := os.Create(f)
-		fmt.Fprintln(file, "category,technique,status_code,size,time")
-		for _, r := range s.results {
-			fmt.Fprintf(file, "\"%s\",\"%s\",%d,%d,%.2f\n", r.Category, r.Technique, r.StatusCode, r.Size, r.Time)
+		file, err := os.Create(f)
+		if err != nil {
+			fmt.Printf("\n  %sCSV write error: %v%s\n", Red, err, Reset)
+		} else {
+			fmt.Fprintln(file, "category,technique,status_code,size,time")
+			for _, r := range s.results {
+				fmt.Fprintf(file, "\"%s\",\"%s\",%d,%d,%.2f\n", r.Category, r.Technique, r.StatusCode, r.Size, r.Time)
+			}
+			file.Close()
+			fmt.Printf("\n  %sCSV: %s%s\n", Cyan, f, Reset)
 		}
-		file.Close()
-		fmt.Printf("\n  %sCSV: %s%s\n", Cyan, f, Reset)
 	}
 
 	fmt.Printf("\n  %sDone in %.1fs%s\n\n", Gray, elapsed.Seconds(), Reset)
@@ -756,6 +941,19 @@ func main() {
 
 	url = strings.TrimRight(url, "/")
 	path = strings.TrimLeft(path, "/")
+
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		fmt.Printf("%sURL must start with http:// or https://%s\n", Red, Reset)
+		os.Exit(1)
+	}
+	if threads <= 0 {
+		fmt.Printf("%sThreads must be greater than 0%s\n", Red, Reset)
+		os.Exit(1)
+	}
+	if timeout <= 0 {
+		fmt.Printf("%sTimeout must be greater than 0%s\n", Red, Reset)
+		os.Exit(1)
+	}
 
 	mods := make(map[string]bool)
 	if modules == "all" {

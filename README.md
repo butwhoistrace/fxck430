@@ -16,12 +16,12 @@ go install github.com/butwhoistrace/fck403@latest
 ### Use
 
 ```bash
-fck403 https://target.com/example                           # run everything
-fck403 https://target.com/example -m methods,paths          # pick modules
-fck403 https://target.com/example -m headers -s             # headers only, show bypasses only
-fck403 https://target.com/example -o json                   # save results as json
-fck403 https://target.com/example -x http://127.0.0.1:8080  # through burp
-fck403 --list                                               # show all modules
+fck403 https://target.com admin                              # run everything
+fck403 https://target.com admin -m methods,paths             # pick modules
+fck403 https://target.com admin -m headers -s                # headers only, show bypasses only
+fck403 -u https://target.com -p admin -o json                # save results as json
+fck403 -u https://target.com -p admin -x http://127.0.0.1:8080  # through burp
+fck403 --list                                                # show all modules
 ```
 
 ### Modules
@@ -29,15 +29,15 @@ fck403 --list                                               # show all modules
 ```
 fck403 --list
 
-  methods    HTTP methods + overrides                    (21 req)
+  methods    HTTP methods + overrides + Accept/CT        (30 req)
   paths      URL encoding, case, extensions, traversal   (47 req)
   headers    IP spoofing: 22 headers x 10 IPs           (220 req)
-  rewrite    X-Original-URL, X-Rewrite-URL                (5 req)
+  rewrite    X-Original-URL, X-Rewrite-URL, X-Fwd-Prefix (9 req)
   ua         Googlebot, Bingbot, Yandex, Facebook         (9 req)
   referer    Referer spoofing                              (6 req)
-  host       Host header manipulation                      (5 req)
+  host       Host header manipulation + confusion          (8 req)
   hopbyhop   Strip security headers via Connection        (11 req)
-  protocol   HTTP/1.0, 1.1, 2                              (3 req)
+  protocol   HTTP/1.0, 1.1, 2 (real protocol switch)      (3 req)
   port       X-Forwarded-Proto, X-Forwarded-Port           (6 req)
   misc       Wayback, direct IP, API version fuzzing    (varies)
 ```
