@@ -10,7 +10,7 @@
 ### Install
 
 ```
-go install github.com/YOUR_USERNAME/fck403@latest
+go install github.com/butwhoistrace/fck403@latest
 ```
 
 ### Use
