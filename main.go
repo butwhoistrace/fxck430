@@ -72,16 +72,7 @@ type Scanner struct {
 
 func banner() {
 	fmt.Println()
-	fmt.Printf("%s        ┌──────────────────────────────────────────┐%s\n", Gray, Reset)
-	fmt.Printf("%s        │                                          │%s\n", Gray, Reset)
-	fmt.Printf("%s        │%s       O    ___        %s┌─────────┐       %s│%s\n", Gray, Cyan, Red, Gray, Reset)
-	fmt.Printf("%s        │%s      /|%s\\%s  |%s///|       %s│ ░░░░░░░ │       %s│%s\n", Gray, Cyan, Cyan, Reset, Yellow, Red, Gray, Reset)
-	fmt.Printf("%s        │%s      / %s\\%s  |%s///|%s======%s>%s│ ░ %s403%s ░ │%s %s**    %s│%s\n", Gray, Cyan, Cyan, Reset, Yellow, Yellow, White, Reset, White, Red, Red, Yellow, Gray, Reset)
-	fmt.Printf("%s        │%s           %s|%s___|       %s│ ░░░%s/%s░░░ │%s  %s*   %s│%s\n", Gray, Reset, Yellow, Yellow, Red, Red, Yellow, Red, Yellow, Gray, Reset)
-	fmt.Printf("%s        │%s                        %s└───%s/%s─────┘%s   %s*  %s│%s\n", Gray, Reset, Red, Red, Yellow, Red, Yellow, Gray, Reset)
-	fmt.Printf("%s        │                           %s/%s              │%s\n", Gray, Yellow, Gray, Reset)
-	fmt.Printf("%s        └──────────────────────────────────────────┘%s\n", Gray, Reset)
-	fmt.Println()
+    fmt.Println()
 	fmt.Printf("%s   ███████╗ ██████╗██╗  ██╗██╗  ██╗ ██████╗ ██████╗ %s\n", White, Reset)
 	fmt.Printf("%s   ██╔════╝██╔════╝██║ ██╔╝██║  ██║██╔═══██╗╚════██╗%s\n", White, Reset)
 	fmt.Printf("%s   █████╗  ██║     █████╔╝ ███████║██║   ██║ █████╔╝%s\n", BGreen, Reset)
@@ -89,9 +80,6 @@ func banner() {
 	fmt.Printf("%s   ██║     ╚██████╗██║  ██╗     ██║╚██████╔╝██████╔╝%s\n", BCyan, Reset)
 	fmt.Printf("%s   ╚═╝      ╚═════╝╚═╝  ╚═╝     ╚═╝ ╚═════╝ ╚═════╝ %s\n", BCyan, Reset)
 	fmt.Println()
-	fmt.Printf("%s   ─────────────────────────────────────────────────%s\n", Gray, Reset)
-	fmt.Printf("%s    v%s %s│%s 300+ techniques %s│%s 11 vectors %s│%s Go %s│%s 0 deps%s\n", Gray, version, White, Gray, White, Gray, White, Gray, White, Gray, Reset)
-	fmt.Printf("%s   ─────────────────────────────────────────────────%s\n", Gray, Reset)
 	fmt.Println()
 }
 
