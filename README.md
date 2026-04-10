@@ -43,13 +43,13 @@ fck403 -u <url> -p <path> [flags]
 ```
 
 ```bash
-fck403 https://target.com admin                          # all modules, full scan
-fck403 https://target.com admin -m paths,headers -s      # selected modules, bypasses only
-fck403 https://target.com admin -d 100 -L                # 100ms delay + follow redirects
-fck403 https://target.com api/v1/dashboard -o json       # multi-segment path, JSON output
+fck403 https://target.com admin                           # all modules, full scan
+fck403 https://target.com admin -m paths,headers -s       # selected modules, bypasses only
+fck403 https://target.com admin -d 100 -L                 # 100ms delay + follow redirects
+fck403 https://target.com api/v1/dashboard -o json        # multi-segment path, JSON output
 fck403 https://target.com admin --match "admin|dashboard" # highlight body content matches
 fck403 https://target.com admin -s --no-color | grep PATH # pipe-friendly, no ANSI
-fck403 https://target.com admin -x http://127.0.0.1:8080 # through Burp
+fck403 https://target.com admin -x http://127.0.0.1:8080  # through Burp
 fck403 --list                                             # show all modules
 ```
 
