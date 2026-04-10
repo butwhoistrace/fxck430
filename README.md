@@ -1,120 +1,196 @@
-
-<h1 align="center">FCK403</h1>
 <p align="center">
-  <b>Smash through 403 Forbidden.</b><br>
-  Go · zero dependencies · 480+ techniques · 11 modules · baseline fingerprinting
+<pre>
+   ███████╗ ██████╗██╗  ██╗██╗  ██╗ ██████╗ ██████╗ 
+   ██╔════╝██╔════╝██║ ██╔╝██║  ██║██╔═══██╗╚════██╗
+   █████╗  ██║     █████╔╝ ███████║██║   ██║ █████╔╝
+   ██╔══╝  ██║     ██╔═██╗ ╚════██║██║   ██║ ╚═══██╗
+   ██║     ╚██████╗██║  ██╗     ██║╚██████╔╝██████╔╝
+   ╚═╝      ╚═════╝╚═╝  ╚═╝     ╚═╝ ╚═════╝ ╚═════╝
+</pre>
 </p>
 
+<h3 align="center">Smash through 403 Forbidden.</h3>
+
 <p align="center">
-  <code>go install github.com/butwhoistrace/fck403@latest</code>
+  <img src="https://img.shields.io/badge/go-1.22+-00ADD8?style=flat&logo=go" alt="Go">
+  <img src="https://img.shields.io/badge/dependencies-zero-success" alt="Zero deps">
+  <img src="https://img.shields.io/badge/techniques-480+-blueviolet" alt="480+ techniques">
+  <img src="https://img.shields.io/badge/version-3.0-blue" alt="v3.0">
 </p>
 
 ---
 
-## Quick Start
+## Install
 
-```bash
-fck403 https://target.com admin                    # run all modules
-fck403 https://target.com admin -m paths,headers   # pick modules
-fck403 https://target.com admin -s                 # only show bypasses
+```
+go install github.com/butwhoistrace/fck403@latest
 ```
 
-## Features
+Or clone and build:
 
-- **Baseline fingerprinting** — fingerprints the target (403), a random 404, and the root page before scanning. Compares every response by status + size + body hash to eliminate false positives
-- **Smart classification** — distinguishes real bypasses from anomalies (TRACE reflections, 400/405 responses) and false positives (root page served instead of admin)
-- **11 attack modules** — methods, path manipulation, IP spoofing, URL rewrite abuse, user-agent spoofing, referer tricks, host confusion, hop-by-hop abuse, protocol switching, port/proto headers, misc
-- **Per-segment path manipulation** — multi-segment paths like `api/v1/dashboard` get traversal/encoding tricks injected at every segment boundary
-- **Header combinations** — tests multi-header attacks (XFF + X-Real-IP + Client-IP together), not just individual headers
-- **Body content matching** — `--match "dashboard"` highlights responses containing specific content
-- **Rate limiting** — `-d 100` adds 100ms delay between requests to evade WAF rate limits
-- **Redirect following** — `-L` follows 301/302 chains to confirm if redirects lead to actual content
-- **Retry on failure** — automatic single retry with 500ms backoff on network errors
-- **Real protocol switching** — separate HTTP transports for HTTP/1.0, HTTP/1.1, and HTTP/2
-- **Zero dependencies** — pure Go stdlib, single binary
+```bash
+git clone https://github.com/butwhoistrace/fck403.git
+cd fck403 && go build -o fck403 .
+```
+
+---
+
+## Usage
+
+```bash
+fck403 <url> <path> [flags]
+fck403 -u <url> -p <path> [flags]
+```
+
+```bash
+fck403 https://target.com admin                          # all modules, full scan
+fck403 https://target.com admin -m paths,headers -s      # selected modules, bypasses only
+fck403 https://target.com admin -d 100 -L                # 100ms delay + follow redirects
+fck403 https://target.com api/v1/dashboard -o json       # multi-segment path, JSON output
+fck403 https://target.com admin --match "admin|dashboard" # highlight body content matches
+fck403 https://target.com admin -s --no-color | grep PATH # pipe-friendly, no ANSI
+fck403 https://target.com admin -x http://127.0.0.1:8080 # through Burp
+fck403 --list                                             # show all modules
+```
+
+---
+
+## What It Does
+
+Give it a URL that returns **403 Forbidden**. It fires **480+ requests** across 11 attack modules — different methods, path encodings, spoofed headers, protocol tricks — and shows you what gets through.
+
+Before scanning, it **fingerprints 3 baseline responses** (the 403 page, a random 404, and the root page) by status code, body size, and MD5 hash. Every scan result is compared against these fingerprints to **eliminate false positives** automatically.
+
+Results are classified into 5 categories:
+
+| Color | Category | Meaning |
+|:---:|---|---|
+| **Green** | **Bypass** | Different response from baseline — real access |
+| **Cyan** | **Anomaly** | 400/405/TRACE — server quirk, not a real bypass |
+| **Yellow** | **Redirect** | 301/302 — worth following up with `-L` |
+| **Red** | **Blocked** | 403/401 — wall held |
+| **Gray** | **False positive** | Response matches baseline/404/root fingerprint |
+
+---
 
 ## Modules
 
 ```
-fck403 --list
-
-  methods    HTTP methods + overrides + Accept/CT/Encoding/Lang   (48 req)
-  paths      Path manipulation, encoding, case, traversal         (47+ req)
-  headers    IP spoofing: 22 headers x 15 IPs + combos           (335 req)
-  rewrite    X-Original-URL, X-Rewrite-URL, X-Forwarded-Prefix    (9 req)
-  ua         Googlebot, Bingbot, Yandex, Facebook, curl            (9 req)
-  referer    Referer header spoofing                                (6 req)
-  host       Host header manipulation + confusion attacks           (8 req)
-  hopbyhop   Hop-by-hop header abuse via Connection                (11 req)
-  protocol   HTTP/1.0, HTTP/1.1, HTTP/2 (real protocol switch)     (3 req)
-  port       X-Forwarded-Proto, X-Forwarded-Port                    (6 req)
-  misc       Wayback Machine, direct IP, API version fuzzing     (varies)
+  methods    HTTP methods + overrides + Accept/CT/Encoding/Lang   48 req
+  paths      Path normalization, encoding, case, traversal       47+ req
+  headers    IP spoofing: 22 headers × 15 IPs + combos          335 req
+  rewrite    X-Original-URL, X-Rewrite-URL, X-Forwarded-Prefix    9 req
+  ua         Googlebot, Bingbot, Yandex, Facebook, curl            9 req
+  referer    Referer header spoofing                                6 req
+  host       Host header manipulation + confusion attacks           8 req
+  hopbyhop   Hop-by-hop header abuse via Connection                11 req
+  protocol   HTTP/1.0, HTTP/1.1, HTTP/2 (real protocol switch)     3 req
+  port       X-Forwarded-Proto, X-Forwarded-Port                    6 req
+  misc       Wayback Machine, direct IP, API version fuzzing    varies
 ```
 
-Pick one: `-m headers` · pick several: `-m methods,paths,ua` · or run all (default).
+Pick one `-m headers` · pick several `-m methods,paths,ua` · or run all (default).
+
+---
 
 ## Flags
 
+| Flag | Description | Default |
+|---|---|---|
+| `-u` | Target URL | — |
+| `-p` | Target path | — |
+| `-t` | Threads | `10` |
+| `-T` | Timeout (seconds) | `10` |
+| `-d` | Delay between requests (ms) | `0` |
+| `-m` | Modules (comma-separated or `all`) | `all` |
+| `-o` | Output format: `text` / `json` / `csv` | `text` |
+| `-x` | Proxy URL (e.g. Burp) | — |
+| `-c` | Cookie string | — |
+| `-H` | Custom header (`Key: Value`) | — |
+| `-L` | Follow redirects | `false` |
+| `-s` | Show only bypasses | `false` |
+| `-v` | Verbose (show anomalies + false positives) | `false` |
+| `--match` | Highlight responses where body matches regex | — |
+| `--no-color` | Disable ANSI color output | `false` |
+| `--list` | List available modules and exit | — |
+
+> **Note:** URL and path can also be passed as positional arguments:
+> `fck403 https://target.com admin` is the same as `fck403 -u https://target.com -p admin`
+
+---
+
+## Example Output
+
 ```
-Target & Scan                    Output & Filter
-─────────────                    ───────────────
--u   target URL                  -o   text/json/csv
--p   target path                 -s   show only bypasses
--t   threads        (10)         -v   verbose (show anomalies, FPs)
--T   timeout        (10s)        --match  highlight body regex matches
--d   delay in ms    (0)          --no-color  disable ANSI colors
+  Target:   https://example.com/intra/dashboard
+  Threads:  10
+  Timeout:  10s
+  Delay:    100ms
+  Modules:  methods, paths, headers, rewrite, ua, referer, host, hopbyhop, protocol, port, misc
 
-Network                          Modules
-───────                          ───────
--x   proxy URL (Burp etc.)       -m   module list (default: all)
--c   cookie string               --list  show available modules
--H   custom header
--L   follow redirects
+  Fingerprinting baseline...
+  Baseline:  [403] 1247 B  (target response)
+  NotFound:  [404]  853 B  (random path)
+  RootPage:  [200] 4821 B  (root / response)
+
+  CODE     SIZE   TIME   CATEGORY          TECHNIQUE
+  ──────────────────────────────────────────────────────────
+
+  [1/11] Path Manipulation
+  [403]    1247 B   0.19s  PATH             https://example.com/%2e/intra/dashboard
+  [200]    8432 B   0.18s  PATH             https://example.com/intra/dashboard/
+  [200]    8432 B   0.21s  PATH             https://example.com/intra/dashboard/.
+  [200]    8432 B   0.19s  PATH             https://example.com//intra/dashboard//
+  ...
+
+  RESULTS
+  ──────────────────────────────────────────────────────────
+  Total:       481
+  Bypassed:    6
+  Anomalies:   3   (400/405/TRACE — not real bypasses)
+  Redirects:   1
+  Blocked:     439
+  False pos:   2   (matched baseline/404/root)
+  Errors:      30
+
+  SMASHED THROUGH:
+  ──────────────────────────────────────────────────────────
+  [200]    8432 B  PATH   https://example.com/intra/dashboard/
+  [200]    8432 B  PATH   https://example.com/intra/dashboard/.
+  [200]    8432 B  PATH   https://example.com//intra/dashboard//
+  [200]    8432 B  PATH   https://example.com/./intra/dashboard/./
+  [200]    8432 B  PATH   https://example.com/intra;/dashboard
+  [200]    8432 B  PATH   https://example.com/intra/dAshboard
+
+  REDIRECTS (worth checking):
+  [302]       0 B  IP-HEADER  -H 'X-Forwarded-For: 10.0.0.1' -> /intra/dashboard/
 ```
 
-## Usage Examples
+---
 
-```bash
-# Basic scan — run everything against /admin
-fck403 https://target.com admin
+## How Baseline Fingerprinting Works
 
-# Only path + header tricks, show bypasses only
-fck403 https://target.com admin -m paths,headers -s
+Most 403 bypass tools report everything that isn't 403 as a "bypass" — including TRACE reflections, error pages, and the site's homepage being served instead of the blocked content. This creates noise.
 
-# Through Burp proxy with 50ms rate limit
-fck403 https://target.com admin -x http://127.0.0.1:8080 -d 50
+FCK403 solves this by taking **3 fingerprints before scanning**:
 
-# Follow redirects to confirm XFF IP spoofing bypasses
-fck403 https://target.com admin -m headers -L -s
+| Fingerprint | What it catches |
+|---|---|
+| **Baseline** (target → 403) | Custom error pages that return 200 with the same blocked content |
+| **NotFound** (random path → 404) | Soft-404 catch-all pages, SPAs returning 200 for everything |
+| **RootPage** (/ → 200) | Rewrite headers that get ignored and just serve the homepage |
 
-# Search for "dashboard" in response bodies
-fck403 https://target.com admin --match "dashboard"
+Each fingerprint stores **status code + body size + MD5 body hash**. If a scan response matches any fingerprint exactly, it's classified as a **false positive** and filtered from the bypass list.
 
-# Multi-segment path with JSON output
-fck403 https://target.com api/v1/dashboard -o json
+When FCK403 says **"0 bypasses found"**, it means zero. Not "zero real ones but here's 5 fake ones".
 
-# Pipe-friendly output (no colors)
-fck403 https://target.com admin -s --no-color | grep PATH
-
-# Verbose mode — see anomalies and false positives
-fck403 https://target.com admin -v
-```
-
-## How It Works
-
-1. **Fingerprint** — sends 3 baseline requests: the target path (expects 403), a random non-existent path (expects 404), and the root page. Records status code, body size, and MD5 hash for each
-2. **Scan** — fires 480+ requests across all enabled modules using concurrent goroutines with semaphore-based throttling
-3. **Classify** — compares each response against the 3 fingerprints:
-   - Matches baseline/404/root fingerprint → **false positive** (filtered)
-   - 403/401 → **blocked**
-   - 400/405/TRACE-200 → **anomaly** (not a real bypass)
-   - 3xx → **redirect** (worth investigating)
-   - Everything else → **bypass** (highlighted green)
-4. **Report** — summary with bypass count, redirect targets, anomaly breakdown, and optional JSON/CSV export
+---
 
 ## Disclaimer
 
-Authorized testing only. Only use this tool on systems you have explicit permission to test.
+**Authorized testing only.** Only use this tool on systems you have explicit permission to test.
+
+---
 
 ## Credits
 
