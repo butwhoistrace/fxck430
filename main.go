@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -59,16 +60,20 @@ type Result struct {
 	StatusCode int     `json:"status_code"`
 	Size       int64   `json:"size"`
 	Time       float64 `json:"time"`
+	bodyHash   [16]byte
 }
 
 type Scanner struct {
-	cfg     Config
-	client  *http.Client
-	results []Result
-	mu      sync.Mutex
-	sem     chan struct{}
-	step    int
-	total   int
+	cfg      Config
+	client   *http.Client
+	results  []Result
+	mu       sync.Mutex
+	sem      chan struct{}
+	step     int
+	total    int
+	baseline Result // fingerprint of the 403 response
+	notfound Result // fingerprint of a random 404 path
+	rootpage Result // fingerprint of the root page (to detect rewrite false positives)
 }
 
 func banner() {
@@ -215,6 +220,7 @@ func (s *Scanner) doRequestWithClient(client *http.Client, category, technique, 
 		StatusCode: resp.StatusCode,
 		Size:       size,
 		Time:       elapsed,
+		bodyHash:   md5.Sum(body),
 	}
 
 	s.mu.Lock()
@@ -228,13 +234,13 @@ func (s *Scanner) printResult(r Result) {
 	if s.cfg.Output != "text" {
 		return
 	}
-	if s.cfg.SuccessOnly && (r.StatusCode == 403 || r.StatusCode == 401) {
+	if s.cfg.SuccessOnly && !s.isLikelyBypass(r) {
 		return
 	}
 
 	color := Red
 	switch {
-	case r.StatusCode >= 200 && r.StatusCode < 300:
+	case s.isLikelyBypass(r):
 		color = Green
 	case r.StatusCode >= 300 && r.StatusCode < 400:
 		color = Yellow
@@ -253,6 +259,67 @@ func (s *Scanner) section(name string) {
 
 func (s *Scanner) baseURL() string {
 	return fmt.Sprintf("%s/%s", s.cfg.URL, s.cfg.Path)
+}
+
+func (s *Scanner) doBaselineRequest(reqURL string) Result {
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return Result{}
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	if s.cfg.Cookie != "" {
+		req.Header.Set("Cookie", s.cfg.Cookie)
+	}
+	if s.cfg.Header != "" {
+		parts := strings.SplitN(s.cfg.Header, ":", 2)
+		if len(parts) == 2 {
+			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		}
+	}
+
+	start := time.Now()
+	resp, err := s.client.Do(req)
+	elapsed := time.Since(start).Seconds()
+	if err != nil {
+		return Result{}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Result{StatusCode: resp.StatusCode, Time: elapsed}
+	}
+
+	return Result{
+		StatusCode: resp.StatusCode,
+		Size:       int64(len(body)),
+		Time:       elapsed,
+		bodyHash:   md5.Sum(body),
+	}
+}
+
+func (s *Scanner) isLikelyBypass(r Result) bool {
+	// 403/401 are always blocked
+	if r.StatusCode == 403 || r.StatusCode == 401 {
+		return false
+	}
+	// Same response as the original 403 page (custom error page returning 200)
+	if r.StatusCode == s.baseline.StatusCode && r.Size == s.baseline.Size && r.bodyHash == s.baseline.bodyHash {
+		return false
+	}
+	// Same response as a random non-existent path (default 404/error page)
+	if s.notfound.StatusCode != 0 && r.StatusCode == s.notfound.StatusCode && r.Size == s.notfound.Size && r.bodyHash == s.notfound.bodyHash {
+		return false
+	}
+	// Same response as root page (rewrite headers that get ignored serve / instead)
+	if s.rootpage.StatusCode != 0 && r.StatusCode == s.rootpage.StatusCode && r.Size == s.rootpage.Size && r.bodyHash == s.rootpage.bodyHash {
+		return false
+	}
+	// Redirects are interesting but not confirmed bypasses
+	if r.StatusCode >= 300 && r.StatusCode < 400 {
+		return false
+	}
+	return true
 }
 
 // ── MODULE: HTTP Methods ─────────────────────────────────────────────────────
@@ -802,13 +869,30 @@ func (s *Scanner) Run() {
 	}
 	fmt.Printf("  %sModules:%s  %s\n", Bold, Reset, strings.Join(active, ", "))
 
+	// Fingerprint baseline responses for false-positive detection
+	fmt.Printf("\n%s  Fingerprinting baseline...%s\n", Gray, Reset)
+	s.baseline = s.doBaselineRequest(s.baseURL())
+	s.notfound = s.doBaselineRequest(fmt.Sprintf("%s/fck403-notfound-%d", s.cfg.URL, time.Now().UnixNano()))
+	rootURL := strings.TrimRight(s.cfg.URL, "/") + "/"
+	if rootURL != s.baseURL() {
+		s.rootpage = s.doBaselineRequest(rootURL)
+	}
+
+	fmt.Printf("  %sBaseline:%s  [%d] %d B %s(target response)%s\n", Bold, Reset, s.baseline.StatusCode, s.baseline.Size, Gray, Reset)
+	fmt.Printf("  %sNotFound:%s  [%d] %d B %s(random path)%s\n", Bold, Reset, s.notfound.StatusCode, s.notfound.Size, Gray, Reset)
+	if s.rootpage.StatusCode != 0 {
+		fmt.Printf("  %sRootPage:%s  [%d] %d B %s(root / response)%s\n", Bold, Reset, s.rootpage.StatusCode, s.rootpage.Size, Gray, Reset)
+	}
+
 	fmt.Printf("\n%s  CODE     SIZE   TIME   CATEGORY          TECHNIQUE%s\n", Gray, Reset)
 	fmt.Printf("%s  ──────────────────────────────────────────────────────────%s\n", Gray, Reset)
 
-	// Baseline
+	// Add baseline to results
 	s.step = 0
 	s.total = len(active)
-	s.doRequest("BASELINE", s.baseURL(), "GET", s.baseURL(), nil)
+	s.baseline.Category = "BASELINE"
+	s.baseline.Technique = s.baseURL()
+	s.results = append(s.results, s.baseline)
 
 	start := time.Now()
 
@@ -840,27 +924,38 @@ func (s *Scanner) printSummary(elapsed time.Duration) {
 	fmt.Printf("%s  ──────────────────────────────────────────────────────────%s\n", Gray, Reset)
 
 	total := len(s.results)
-	var success, redirects, blocked, errors int
+	var bypassed, redirects, blocked, falsepos, errors int
 	var bypasses []Result
+	var fps []Result
 
 	for _, r := range s.results {
+		if r.Category == "BASELINE" {
+			continue
+		}
 		switch {
-		case r.StatusCode >= 200 && r.StatusCode < 300:
-			success++
+		case s.isLikelyBypass(r):
+			bypassed++
 			bypasses = append(bypasses, r)
 		case r.StatusCode >= 300 && r.StatusCode < 400:
 			redirects++
 		case r.StatusCode == 403 || r.StatusCode == 401:
 			blocked++
+		case r.StatusCode >= 200 && r.StatusCode < 300:
+			// 200 but matches baseline or notfound -> false positive
+			falsepos++
+			fps = append(fps, r)
 		default:
 			errors++
 		}
 	}
 
-	fmt.Printf("  Total:       %s%d%s\n", Bold, total, Reset)
-	fmt.Printf("  %sBypassed:    %d%s\n", Green, success, Reset)
+	fmt.Printf("  Total:       %s%d%s\n", Bold, total-1, Reset) // exclude baseline from count
+	fmt.Printf("  %sBypassed:    %d%s\n", Green, bypassed, Reset)
 	fmt.Printf("  %sRedirects:   %d%s\n", Yellow, redirects, Reset)
 	fmt.Printf("  %sBlocked:     %d%s\n", Red, blocked, Reset)
+	if falsepos > 0 {
+		fmt.Printf("  %sFalse pos:   %d%s %s(matched baseline/404/root)%s\n", Gray, falsepos, Reset, Gray, Reset)
+	}
 	fmt.Printf("  %sErrors:      %d%s\n", Gray, errors, Reset)
 
 	if len(bypasses) > 0 {
@@ -879,6 +974,13 @@ func (s *Scanner) printSummary(elapsed time.Duration) {
 			if r.StatusCode >= 300 && r.StatusCode < 400 {
 				fmt.Printf("  %s[%d]  %6d B  %-16s %s%s\n", Yellow, r.StatusCode, r.Size, r.Category, r.Technique, Reset)
 			}
+		}
+	}
+
+	if len(fps) > 0 && s.cfg.Verbose {
+		fmt.Printf("\n  %sFALSE POSITIVES (same as baseline/404/root):%s\n", Gray, Reset)
+		for _, r := range fps {
+			fmt.Printf("  %s[%d]  %6d B  %-16s %s%s\n", Gray, r.StatusCode, r.Size, r.Category, r.Technique, Reset)
 		}
 	}
 
