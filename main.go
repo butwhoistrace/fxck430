@@ -40,18 +40,20 @@ var moduleNames = []string{
 }
 
 type Config struct {
-	URL         string
-	Path        string
-	Threads     int
-	Timeout     int
-	Output      string
-	Proxy       string
-	Cookie      string
-	Header      string
-	SuccessOnly bool
-	Verbose     bool
-	Modules     map[string]bool
-	ListModules bool
+	URL             string
+	Path            string
+	Threads         int
+	Timeout         int
+	Delay           int // milliseconds between requests
+	Output          string
+	Proxy           string
+	Cookie          string
+	Header          string
+	SuccessOnly     bool
+	Verbose         bool
+	FollowRedirects bool
+	Modules         map[string]bool
+	ListModules     bool
 }
 
 type Result struct {
@@ -60,6 +62,7 @@ type Result struct {
 	StatusCode int     `json:"status_code"`
 	Size       int64   `json:"size"`
 	Time       float64 `json:"time"`
+	Location   string  `json:"location,omitempty"`
 	bodyHash   [16]byte
 }
 
@@ -93,7 +96,7 @@ func listModules() {
 	banner()
 	fmt.Printf("%s  Available modules:%s\n\n", Bold, Reset)
 	descs := map[string]string{
-		"methods":  "HTTP methods + overrides + Accept/Content-Type (30 requests)",
+		"methods":  "HTTP methods + overrides + Accept/CT/Encoding/Lang (48 requests)",
 		"paths":    "Path manipulation, encoding, case, extensions (47 requests)",
 		"headers":  "IP spoofing headers x10 IPs (220 requests)",
 		"rewrite":  "X-Original-URL, X-Rewrite-URL, X-Forwarded-Prefix (9 requests)",
@@ -137,9 +140,11 @@ func NewScanner(cfg Config) *Scanner {
 	client := &http.Client{
 		Timeout:   time.Duration(cfg.Timeout) * time.Second,
 		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	}
+	if !cfg.FollowRedirects {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
-		},
+		}
 	}
 
 	total := 0
@@ -164,6 +169,10 @@ func (s *Scanner) doRequest(category, technique, method, reqURL string, headers 
 func (s *Scanner) doRequestWithClient(client *http.Client, category, technique, method, reqURL string, headers map[string]string) {
 	s.sem <- struct{}{}
 	defer func() { <-s.sem }()
+
+	if s.cfg.Delay > 0 {
+		time.Sleep(time.Duration(s.cfg.Delay) * time.Millisecond)
+	}
 
 	req, err := http.NewRequest(method, reqURL, nil)
 	if err != nil {
@@ -220,6 +229,7 @@ func (s *Scanner) doRequestWithClient(client *http.Client, category, technique, 
 		StatusCode: resp.StatusCode,
 		Size:       size,
 		Time:       elapsed,
+		Location:   resp.Header.Get("Location"),
 		bodyHash:   md5.Sum(body),
 	}
 
@@ -248,8 +258,12 @@ func (s *Scanner) printResult(r Result) {
 		color = Gray
 	}
 
-	fmt.Printf("%s  [%d]  %6d B  %5.2fs  %-16s %s%s\n",
-		color, r.StatusCode, r.Size, r.Time, r.Category, r.Technique, Reset)
+	loc := ""
+	if r.Location != "" {
+		loc = fmt.Sprintf(" -> %s", r.Location)
+	}
+	fmt.Printf("%s  [%d]  %6d B  %5.2fs  %-16s %s%s%s\n",
+		color, r.StatusCode, r.Size, r.Time, r.Category, r.Technique, loc, Reset)
 }
 
 func (s *Scanner) section(name string) {
@@ -382,6 +396,32 @@ func (s *Scanner) runMethods() {
 			defer wg.Done()
 			s.doRequest("CONTENT-TYPE", fmt.Sprintf("-X POST -H 'Content-Type: %s'", ctype), "POST", s.baseURL(), map[string]string{"Content-Type": ctype, "Content-Length": "0"})
 		}(ct)
+	}
+
+	// Accept-Encoding - some backends/CDNs serve different content or skip auth based on encoding
+	encodings := []string{
+		"gzip", "deflate", "br", "identity", "gzip, deflate, br",
+		"*", "compress", "chunked",
+	}
+	for _, enc := range encodings {
+		wg.Add(1)
+		go func(e string) {
+			defer wg.Done()
+			s.doRequest("ACCEPT-ENC", fmt.Sprintf("-H 'Accept-Encoding: %s'", e), "GET", s.baseURL(), map[string]string{"Accept-Encoding": e})
+		}(enc)
+	}
+
+	// Accept-Language - geo-restricted content may respond differently to language hints
+	languages := []string{
+		"en-US,en;q=0.9", "en", "*", "de", "fr", "ja", "zh-CN,zh;q=0.9",
+		"es-ES,es;q=0.9", "ar", "ru",
+	}
+	for _, lang := range languages {
+		wg.Add(1)
+		go func(l string) {
+			defer wg.Done()
+			s.doRequest("ACCEPT-LANG", fmt.Sprintf("-H 'Accept-Language: %s'", l), "GET", s.baseURL(), map[string]string{"Accept-Language": l})
+		}(lang)
 	}
 
 	wg.Wait()
@@ -857,6 +897,12 @@ func (s *Scanner) Run() {
 	fmt.Printf("  %sThreads:%s  %d\n", Bold, Reset, s.cfg.Threads)
 	fmt.Printf("  %sTimeout:%s  %ds\n", Bold, Reset, s.cfg.Timeout)
 	fmt.Printf("  %sOutput:%s   %s\n", Bold, Reset, s.cfg.Output)
+	if s.cfg.Delay > 0 {
+		fmt.Printf("  %sDelay:%s    %dms\n", Bold, Reset, s.cfg.Delay)
+	}
+	if s.cfg.FollowRedirects {
+		fmt.Printf("  %sRedirect:%s follow (-L)\n", Bold, Reset)
+	}
 	if s.cfg.Proxy != "" {
 		fmt.Printf("  %sProxy:%s    %s\n", Bold, Reset, s.cfg.Proxy)
 	}
@@ -1017,18 +1063,20 @@ func (s *Scanner) printSummary(elapsed time.Duration) {
 
 func main() {
 	var (
-		url         string
-		path        string
-		threads     int
-		timeout     int
-		output      string
-		proxy       string
-		cookie      string
-		header      string
-		successOnly bool
-		verbose     bool
-		modules     string
-		list        bool
+		url             string
+		path            string
+		threads         int
+		timeout         int
+		delay           int
+		output          string
+		proxy           string
+		cookie          string
+		header          string
+		successOnly     bool
+		verbose         bool
+		followRedirects bool
+		modules         string
+		list            bool
 	)
 
 	flag.StringVar(&url, "u", "", "Target URL")
@@ -1041,6 +1089,8 @@ func main() {
 	flag.StringVar(&header, "H", "", "Custom header")
 	flag.BoolVar(&successOnly, "s", false, "Show only bypasses")
 	flag.BoolVar(&verbose, "v", false, "Verbose")
+	flag.IntVar(&delay, "d", 0, "Delay between requests (ms)")
+	flag.BoolVar(&followRedirects, "L", false, "Follow redirects")
 	flag.StringVar(&modules, "m", "all", "Modules: all or comma-separated (methods,paths,headers,rewrite,ua,referer,host,hopbyhop,protocol,port,misc)")
 	flag.BoolVar(&list, "list", false, "List available modules")
 
@@ -1120,8 +1170,9 @@ func main() {
 
 	cfg := Config{
 		URL: url, Path: path, Threads: threads, Timeout: timeout,
-		Output: output, Proxy: proxy, Cookie: cookie, Header: header,
-		SuccessOnly: successOnly, Verbose: verbose, Modules: mods,
+		Delay: delay, Output: output, Proxy: proxy, Cookie: cookie, Header: header,
+		SuccessOnly: successOnly, Verbose: verbose, FollowRedirects: followRedirects,
+		Modules: mods,
 	}
 
 	NewScanner(cfg).Run()
