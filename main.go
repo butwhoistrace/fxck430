@@ -11,14 +11,16 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-const version = "2.1"
+const version = "3.0"
 
-const (
+// color vars — set to empty strings by --no-color
+var (
 	Reset  = "\033[0m"
 	Red    = "\033[0;31m"
 	Green  = "\033[0;32m"
@@ -32,6 +34,11 @@ const (
 	BGreen = "\033[1;32m"
 	BCyan  = "\033[1;36m"
 )
+
+func disableColors() {
+	Reset, Red, Green, Yellow, Blue, Cyan, Gray = "", "", "", "", "", "", ""
+	White, Bold, BRed, BGreen, BCyan = "", "", "", "", ""
+}
 
 var moduleNames = []string{
 	"methods", "paths", "headers", "rewrite",
@@ -49,9 +56,11 @@ type Config struct {
 	Proxy           string
 	Cookie          string
 	Header          string
+	Match           string // body content filter regex
 	SuccessOnly     bool
 	Verbose         bool
 	FollowRedirects bool
+	NoColor         bool
 	Modules         map[string]bool
 	ListModules     bool
 }
@@ -63,6 +72,7 @@ type Result struct {
 	Size       int64   `json:"size"`
 	Time       float64 `json:"time"`
 	Location   string  `json:"location,omitempty"`
+	MatchHit   bool    `json:"match_hit,omitempty"`
 	bodyHash   [16]byte
 }
 
@@ -74,9 +84,10 @@ type Scanner struct {
 	sem      chan struct{}
 	step     int
 	total    int
-	baseline Result // fingerprint of the 403 response
-	notfound Result // fingerprint of a random 404 path
-	rootpage Result // fingerprint of the root page (to detect rewrite false positives)
+	baseline Result         // fingerprint of the 403 response
+	notfound Result         // fingerprint of a random 404 path
+	rootpage Result         // fingerprint of the root page (to detect rewrite false positives)
+	matchRe  *regexp.Regexp // --match body content filter
 }
 
 func banner() {
@@ -98,7 +109,7 @@ func listModules() {
 	descs := map[string]string{
 		"methods":  "HTTP methods + overrides + Accept/CT/Encoding/Lang (48 requests)",
 		"paths":    "Path manipulation, encoding, case, extensions (47 requests)",
-		"headers":  "IP spoofing headers x10 IPs (220 requests)",
+		"headers":  "IP spoofing: 22 headers x 15 IPs + combos (335 requests)",
 		"rewrite":  "X-Original-URL, X-Rewrite-URL, X-Forwarded-Prefix (9 requests)",
 		"ua":       "User-Agent spoofing: Googlebot, Bingbot, etc. (9 requests)",
 		"referer":  "Referer header spoofing (6 requests)",
@@ -154,12 +165,21 @@ func NewScanner(cfg Config) *Scanner {
 		}
 	}
 
-	return &Scanner{
+	sc := &Scanner{
 		cfg:    cfg,
 		client: client,
 		sem:    make(chan struct{}, cfg.Threads),
 		total:  total,
 	}
+	if cfg.Match != "" {
+		re, err := regexp.Compile("(?i)" + cfg.Match)
+		if err != nil {
+			fmt.Printf("%sInvalid --match regex: %v%s\n", Red, err, Reset)
+			os.Exit(1)
+		}
+		sc.matchRe = re
+	}
+	return sc
 }
 
 func (s *Scanner) doRequest(category, technique, method, reqURL string, headers map[string]string) {
@@ -174,53 +194,72 @@ func (s *Scanner) doRequestWithClient(client *http.Client, category, technique, 
 		time.Sleep(time.Duration(s.cfg.Delay) * time.Millisecond)
 	}
 
-	req, err := http.NewRequest(method, reqURL, nil)
-	if err != nil {
-		if s.cfg.Verbose {
-			fmt.Printf("%s  [ERR] %s: %v%s\n", Gray, technique, err, Reset)
+	var resp *http.Response
+	var body []byte
+	var elapsed float64
+
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequest(method, reqURL, nil)
+		if err != nil {
+			if s.cfg.Verbose {
+				fmt.Printf("%s  [ERR] %s: %v%s\n", Gray, technique, err, Reset)
+			}
+			return
 		}
+
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+		if s.cfg.Cookie != "" {
+			req.Header.Set("Cookie", s.cfg.Cookie)
+		}
+		if s.cfg.Header != "" {
+			parts := strings.SplitN(s.cfg.Header, ":", 2)
+			if len(parts) == 2 {
+				req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+			}
+		}
+
+		for k, v := range headers {
+			if strings.ToLower(k) == "host" {
+				req.Host = v
+			} else {
+				req.Header.Set(k, v)
+			}
+		}
+
+		start := time.Now()
+		resp, err = client.Do(req)
+		elapsed = time.Since(start).Seconds()
+
+		if err != nil {
+			if attempt == 0 {
+				time.Sleep(500 * time.Millisecond)
+				continue // retry once
+			}
+			if s.cfg.Verbose {
+				fmt.Printf("%s  [ERR] %s: %v%s\n", Gray, technique, err, Reset)
+			}
+			return
+		}
+
+		body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			if attempt == 0 {
+				continue
+			}
+			if s.cfg.Verbose {
+				fmt.Printf("%s  [ERR] %s: read body: %v%s\n", Gray, technique, err, Reset)
+			}
+			return
+		}
+		break // success
+	}
+
+	if resp == nil {
 		return
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	if s.cfg.Cookie != "" {
-		req.Header.Set("Cookie", s.cfg.Cookie)
-	}
-	if s.cfg.Header != "" {
-		parts := strings.SplitN(s.cfg.Header, ":", 2)
-		if len(parts) == 2 {
-			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-		}
-	}
-
-	for k, v := range headers {
-		if strings.ToLower(k) == "host" {
-			req.Host = v
-		} else {
-			req.Header.Set(k, v)
-		}
-	}
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	elapsed := time.Since(start).Seconds()
-
-	if err != nil {
-		if s.cfg.Verbose {
-			fmt.Printf("%s  [ERR] %s: %v%s\n", Gray, technique, err, Reset)
-		}
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		if s.cfg.Verbose {
-			fmt.Printf("%s  [ERR] %s: read body: %v%s\n", Gray, technique, err, Reset)
-		}
-		return
-	}
 	size := int64(len(body))
 
 	result := Result{
@@ -231,6 +270,10 @@ func (s *Scanner) doRequestWithClient(client *http.Client, category, technique, 
 		Time:       elapsed,
 		Location:   resp.Header.Get("Location"),
 		bodyHash:   md5.Sum(body),
+	}
+
+	if s.matchRe != nil {
+		result.MatchHit = s.matchRe.Match(body)
 	}
 
 	s.mu.Lock()
@@ -252,6 +295,8 @@ func (s *Scanner) printResult(r Result) {
 	switch {
 	case s.isLikelyBypass(r):
 		color = Green
+	case s.isAnomaly(r):
+		color = Cyan
 	case r.StatusCode >= 300 && r.StatusCode < 400:
 		color = Yellow
 	case r.StatusCode == 0:
@@ -262,8 +307,12 @@ func (s *Scanner) printResult(r Result) {
 	if r.Location != "" {
 		loc = fmt.Sprintf(" -> %s", r.Location)
 	}
-	fmt.Printf("%s  [%d]  %6d B  %5.2fs  %-16s %s%s%s\n",
-		color, r.StatusCode, r.Size, r.Time, r.Category, r.Technique, loc, Reset)
+	matchTag := ""
+	if r.MatchHit {
+		matchTag = fmt.Sprintf(" %s[MATCH]%s", BGreen, color)
+	}
+	fmt.Printf("%s  [%d]  %6d B  %5.2fs  %-16s %s%s%s%s\n",
+		color, r.StatusCode, r.Size, r.Time, r.Category, r.Technique, loc, matchTag, Reset)
 }
 
 func (s *Scanner) section(name string) {
@@ -312,9 +361,29 @@ func (s *Scanner) doBaselineRequest(reqURL string) Result {
 	}
 }
 
+// isAnomaly returns true for responses that differ from 403 but aren't real bypasses
+// (e.g. TRACE echoes request, CONNECT is a proxy verb, 400 is a parse error)
+func (s *Scanner) isAnomaly(r Result) bool {
+	if r.StatusCode == 400 {
+		return true
+	}
+	if r.StatusCode == 405 {
+		return true
+	}
+	// TRACE always echoes the request body — not a real content bypass
+	if r.StatusCode == 200 && strings.HasPrefix(r.Technique, "-X TRACE ") {
+		return true
+	}
+	return false
+}
+
 func (s *Scanner) isLikelyBypass(r Result) bool {
 	// 403/401 are always blocked
 	if r.StatusCode == 403 || r.StatusCode == 401 {
+		return false
+	}
+	// Anomalies are not real bypasses
+	if s.isAnomaly(r) {
 		return false
 	}
 	// Same response as the original 403 page (custom error page returning 200)
@@ -523,8 +592,14 @@ func (s *Scanner) runHeaders() {
 		"Client-IP", "True-Client-IP", "Cluster-Client-IP", "CF-Connecting-IP",
 		"Fastly-Client-IP", "X-Client-IP", "X-Host", "Via",
 	}
-	ips := []string{"127.0.0.1", "localhost", "10.0.0.1", "172.16.0.1", "192.168.0.1",
-		"0.0.0.0", "127.0.0.1:80", "127.0.0.1:443", "0", "::1"}
+	ips := []string{
+		"127.0.0.1", "localhost", "0.0.0.0", "0", "::1",
+		"10.0.0.1", "10.10.10.1", "10.255.255.1",
+		"172.16.0.1", "172.31.255.1",
+		"192.168.0.1", "192.168.1.1",
+		"127.0.0.1:80", "127.0.0.1:443",
+		"2130706433", // 127.0.0.1 as decimal
+	}
 
 	var wg sync.WaitGroup
 	for _, h := range hdrs {
@@ -540,6 +615,27 @@ func (s *Scanner) runHeaders() {
 			}(h, ip)
 		}
 	}
+
+	// Header combinations — some backends only bypass when multiple headers agree
+	combos := []map[string]string{
+		{"X-Forwarded-For": "127.0.0.1", "X-Forwarded-Host": "localhost", "X-Real-IP": "127.0.0.1"},
+		{"X-Forwarded-For": "127.0.0.1", "X-Original-URL": "/" + s.cfg.Path},
+		{"X-Forwarded-For": "10.0.0.1", "X-Forwarded-Proto": "https", "X-Forwarded-Port": "443"},
+		{"X-Forwarded-For": "192.168.1.1", "X-Real-IP": "192.168.1.1", "Client-IP": "192.168.1.1"},
+		{"X-Custom-IP-Authorization": "127.0.0.1", "True-Client-IP": "127.0.0.1", "CF-Connecting-IP": "127.0.0.1"},
+	}
+	for _, combo := range combos {
+		wg.Add(1)
+		go func(hdrs map[string]string) {
+			defer wg.Done()
+			var parts []string
+			for k, v := range hdrs {
+				parts = append(parts, fmt.Sprintf("%s:%s", k, v))
+			}
+			s.doRequest("IP-COMBO", strings.Join(parts, " + "), "GET", s.baseURL(), hdrs)
+		}(combo)
+	}
+
 	wg.Wait()
 }
 
@@ -906,6 +1002,9 @@ func (s *Scanner) Run() {
 	if s.cfg.Proxy != "" {
 		fmt.Printf("  %sProxy:%s    %s\n", Bold, Reset, s.cfg.Proxy)
 	}
+	if s.cfg.Match != "" {
+		fmt.Printf("  %sMatch:%s    /%s/\n", Bold, Reset, s.cfg.Match)
+	}
 
 	active := []string{}
 	for _, name := range moduleNames {
@@ -970,20 +1069,26 @@ func (s *Scanner) printSummary(elapsed time.Duration) {
 	fmt.Printf("%s  ──────────────────────────────────────────────────────────%s\n", Gray, Reset)
 
 	total := len(s.results)
-	var bypassed, redirects, blocked, falsepos, errors int
-	var bypasses []Result
-	var fps []Result
+	var bypassed, anomalies, redirects, blocked, falsepos, matched, errors int
+	var bypasses, anomalyList, redirectList, fps []Result
 
 	for _, r := range s.results {
 		if r.Category == "BASELINE" {
 			continue
 		}
+		if r.MatchHit {
+			matched++
+		}
 		switch {
 		case s.isLikelyBypass(r):
 			bypassed++
 			bypasses = append(bypasses, r)
+		case s.isAnomaly(r):
+			anomalies++
+			anomalyList = append(anomalyList, r)
 		case r.StatusCode >= 300 && r.StatusCode < 400:
 			redirects++
+			redirectList = append(redirectList, r)
 		case r.StatusCode == 403 || r.StatusCode == 401:
 			blocked++
 		case r.StatusCode >= 200 && r.StatusCode < 300:
@@ -995,12 +1100,18 @@ func (s *Scanner) printSummary(elapsed time.Duration) {
 		}
 	}
 
-	fmt.Printf("  Total:       %s%d%s\n", Bold, total-1, Reset) // exclude baseline from count
+	fmt.Printf("  Total:       %s%d%s\n", Bold, total-1, Reset)
 	fmt.Printf("  %sBypassed:    %d%s\n", Green, bypassed, Reset)
+	if anomalies > 0 {
+		fmt.Printf("  %sAnomalies:   %d%s %s(400/405/TRACE — not real bypasses)%s\n", Cyan, anomalies, Reset, Gray, Reset)
+	}
 	fmt.Printf("  %sRedirects:   %d%s\n", Yellow, redirects, Reset)
 	fmt.Printf("  %sBlocked:     %d%s\n", Red, blocked, Reset)
 	if falsepos > 0 {
 		fmt.Printf("  %sFalse pos:   %d%s %s(matched baseline/404/root)%s\n", Gray, falsepos, Reset, Gray, Reset)
+	}
+	if matched > 0 {
+		fmt.Printf("  %sMatch hits:  %d%s %s(body matched --%s%s%s)%s\n", BGreen, matched, Reset, Gray, Bold, s.cfg.Match, Gray, Reset)
 	}
 	fmt.Printf("  %sErrors:      %d%s\n", Gray, errors, Reset)
 
@@ -1008,18 +1119,35 @@ func (s *Scanner) printSummary(elapsed time.Duration) {
 		fmt.Printf("\n  %s%sSMASHED THROUGH:%s\n", BGreen, Bold, Reset)
 		fmt.Printf("%s  ──────────────────────────────────────────────────────────%s\n", Gray, Reset)
 		for _, r := range bypasses {
-			fmt.Printf("  %s[%d]  %6d B  %-16s %s%s\n", Green, r.StatusCode, r.Size, r.Category, r.Technique, Reset)
+			loc := ""
+			if r.Location != "" {
+				loc = " -> " + r.Location
+			}
+			matchTag := ""
+			if r.MatchHit {
+				matchTag = " [MATCH]"
+			}
+			fmt.Printf("  %s[%d]  %6d B  %-16s %s%s%s%s\n", Green, r.StatusCode, r.Size, r.Category, r.Technique, loc, matchTag, Reset)
 		}
 	} else {
 		fmt.Printf("\n  %sNo bypasses found. Wall held strong.%s\n", Red, Reset)
 	}
 
-	if redirects > 0 {
+	if len(redirectList) > 0 {
 		fmt.Printf("\n  %s%sREDIRECTS (worth checking):%s\n", Yellow, Bold, Reset)
-		for _, r := range s.results {
-			if r.StatusCode >= 300 && r.StatusCode < 400 {
-				fmt.Printf("  %s[%d]  %6d B  %-16s %s%s\n", Yellow, r.StatusCode, r.Size, r.Category, r.Technique, Reset)
+		for _, r := range redirectList {
+			loc := ""
+			if r.Location != "" {
+				loc = " -> " + r.Location
 			}
+			fmt.Printf("  %s[%d]  %6d B  %-16s %s%s%s\n", Yellow, r.StatusCode, r.Size, r.Category, r.Technique, loc, Reset)
+		}
+	}
+
+	if len(anomalyList) > 0 && s.cfg.Verbose {
+		fmt.Printf("\n  %sANOMALIES (not bypasses, but unusual):%s\n", Cyan, Reset)
+		for _, r := range anomalyList {
+			fmt.Printf("  %s[%d]  %6d B  %-16s %s%s\n", Cyan, r.StatusCode, r.Size, r.Category, r.Technique, Reset)
 		}
 	}
 
@@ -1072,9 +1200,11 @@ func main() {
 		proxy           string
 		cookie          string
 		header          string
+		match           string
 		successOnly     bool
 		verbose         bool
 		followRedirects bool
+		noColor         bool
 		modules         string
 		list            bool
 	)
@@ -1091,7 +1221,9 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "Verbose")
 	flag.IntVar(&delay, "d", 0, "Delay between requests (ms)")
 	flag.BoolVar(&followRedirects, "L", false, "Follow redirects")
-	flag.StringVar(&modules, "m", "all", "Modules: all or comma-separated (methods,paths,headers,rewrite,ua,referer,host,hopbyhop,protocol,port,misc)")
+	flag.StringVar(&match, "match", "", "Highlight responses where body matches regex")
+	flag.BoolVar(&noColor, "no-color", false, "Disable colored output")
+	flag.StringVar(&modules, "m", "all", "Modules: all or comma-separated")
 	flag.BoolVar(&list, "list", false, "List available modules")
 
 	flag.Usage = func() {
@@ -1117,6 +1249,10 @@ func main() {
 	}
 
 	flag.Parse()
+
+	if noColor {
+		disableColors()
+	}
 
 	if list {
 		listModules()
@@ -1171,8 +1307,8 @@ func main() {
 	cfg := Config{
 		URL: url, Path: path, Threads: threads, Timeout: timeout,
 		Delay: delay, Output: output, Proxy: proxy, Cookie: cookie, Header: header,
-		SuccessOnly: successOnly, Verbose: verbose, FollowRedirects: followRedirects,
-		Modules: mods,
+		Match: match, SuccessOnly: successOnly, Verbose: verbose,
+		FollowRedirects: followRedirects, NoColor: noColor, Modules: mods,
 	}
 
 	NewScanner(cfg).Run()
